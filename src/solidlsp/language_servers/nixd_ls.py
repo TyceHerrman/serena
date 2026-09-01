@@ -234,10 +234,16 @@ class NixLanguageServer(SolidLanguageServer):
         }
 
     @classmethod
-    def _load_nixd_settings(cls, custom_settings: SolidLSPSettings.CustomLSSettings) -> dict[str, Any]:
+    def _load_nixd_settings(
+        cls,
+        custom_settings: SolidLSPSettings.CustomLSSettings,
+        repository_root_path: str | Path | None = None,
+    ) -> dict[str, Any]:
         """Load nixd settings from ``config_path`` or return the built-in defaults.
 
         :param custom_settings: Nix-specific language-server settings.
+        :param repository_root_path: Project root used to resolve a relative
+            ``config_path``.
         :return: The value of the nixd configuration section.
         :raises ValueError: If ``config_path`` or its JSON document has an invalid shape.
         :raises RuntimeError: If the configuration file cannot be read.
@@ -246,11 +252,13 @@ class NixLanguageServer(SolidLanguageServer):
         if config_path_value is None:
             return cls._create_default_nixd_settings()
         if not isinstance(config_path_value, str) or not config_path_value.strip():
-            raise ValueError("ls_specific_settings.nix.config_path must be a non-empty absolute path")
+            raise ValueError("ls_specific_settings.nix.config_path must be a non-empty path")
 
         config_path = Path(config_path_value).expanduser()
         if not config_path.is_absolute():
-            raise ValueError(f"ls_specific_settings.nix.config_path must be absolute: {config_path_value!r}")
+            if repository_root_path is None:
+                raise ValueError("a relative ls_specific_settings.nix.config_path requires a repository root")
+            config_path = Path(repository_root_path).expanduser().resolve() / config_path
 
         try:
             with config_path.open(encoding="utf-8") as config_file:
@@ -299,7 +307,7 @@ class NixLanguageServer(SolidLanguageServer):
 
     def __init__(self, config: LanguageServerConfig, repository_root_path: str, solidlsp_settings: SolidLSPSettings):
         custom_settings = solidlsp_settings.get_ls_specific_settings(config.ls_id)
-        self._nixd_settings = self._load_nixd_settings(custom_settings)
+        self._nixd_settings = self._load_nixd_settings(custom_settings, repository_root_path)
 
         super().__init__(config, repository_root_path, None, "nix", solidlsp_settings)
         self.request_id = 0

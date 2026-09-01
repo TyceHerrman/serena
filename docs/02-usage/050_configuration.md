@@ -889,7 +889,7 @@ Supported settings:
 | Setting | Default | Description |
 |---|---|---|
 | `ls_path` | PATH/common-path discovery followed by managed installation | Absolute path to a nixd executable or launcher. When set, Serena bypasses its nixd discovery, installation, and version check. |
-| `config_path` | `null` | Absolute path to a UTF-8 JSON file containing the value of the `nixd` settings section. A leading `~` is expanded. |
+| `config_path` | `null` | Path to a UTF-8 JSON file containing the value of the `nixd` settings section. Relative paths are resolved from the project root; a leading `~` is expanded. |
 
 Example:
 
@@ -897,7 +897,7 @@ Example:
 ls_specific_settings:
   nix:
     ls_path: /absolute/path/to/nixd-project
-    config_path: /absolute/path/to/nixd-settings.json
+    config_path: .serena/nixd-settings.json
 ```
 
 The JSON document contains the settings object directly, without an outer `nixd` key:

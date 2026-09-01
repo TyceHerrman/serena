@@ -87,8 +87,22 @@ def test_config_path_loads_bare_nixd_settings_object(tmp_path: Path) -> None:
     assert NixLanguageServer._load_nixd_settings(settings) == expected
 
 
-@pytest.mark.parametrize("config_path", ["", "relative/nixd-settings.json"])
-def test_config_path_must_be_non_empty_and_absolute(config_path: str) -> None:
+def test_relative_config_path_resolves_from_repository_root(tmp_path: Path) -> None:
+    config_path = tmp_path / ".serena/nixd-settings.json"
+    config_path.parent.mkdir()
+    expected = {"formatting": {"command": ["alejandra"]}}
+    config_path.write_text(json.dumps(expected), encoding="utf-8")
+
+    server = _make_server(
+        tmp_path,
+        {"config_path": ".serena/nixd-settings.json"},
+    )
+
+    assert server._nixd_settings == expected
+
+
+def test_config_path_must_be_non_empty() -> None:
+    config_path = ""
     settings = SolidLSPSettings.CustomLSSettings({"config_path": config_path})
 
     with pytest.raises(ValueError, match="config_path must be"):

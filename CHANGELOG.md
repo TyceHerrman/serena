@@ -56,6 +56,7 @@ Status of the `main` branch. Changes prior to the next official version change w
       Note that if the base path is itself ignored, ignored paths cannot be considered.
 
 * Language Servers: 
+  - Nix/nixd: allow `config_path` to be relative to the project root
   - Add Gleam language server support (via the `gleam lsp` server bundled with the Gleam compiler)
   - Allow language server priorities to be configured in `serena_config.yml` (for auto-detection during 
     project creation) 
