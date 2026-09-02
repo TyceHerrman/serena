@@ -10,6 +10,10 @@ from dataclasses import dataclass
 from typing import Any, Literal, cast
 
 import docstring_parser
+from mcp.server.auth.middleware.auth_context import get_access_token
+from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+from mcp.server.auth.provider import AccessToken, TokenVerifier
+from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import server
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.fastmcp.server import Context, FastMCP, Settings
@@ -19,6 +23,7 @@ from mcp.shared.context import LifespanContextT, RequestT
 from mcp.types import ToolAnnotations
 from pydantic_settings import SettingsConfigDict
 from sensai.util import logging
+from starlette.requests import HTTPConnection
 
 from serena.agent import (
     SerenaAgent,
@@ -26,6 +31,7 @@ from serena.agent import (
 from serena.config.context_mode import SerenaAgentContext
 from serena.config.serena_config import LanguageBackend, ModeSelectionDefinition, SerenaConfig
 from serena.constants import DEFAULT_CONTEXT, SERENA_LOG_FORMAT
+from serena.mcp_authorization import SerenaToolAuthorization
 from serena.tools import Tool, ToolCallError
 from serena.util.exception import show_fatal_exception_safe
 from serena.util.logging import MemoryLogHandler
@@ -126,6 +132,11 @@ class SerenaFastMCPTool(FastMCPTool):
         )
 
         self._param_aliases = tool.get_param_aliases()
+        self._can_edit = can_edit
+
+    def can_edit(self) -> bool:
+        """Return whether the wrapped Serena tool can edit project state."""
+        return self._can_edit
 
     async def run(
         self,
@@ -141,6 +152,56 @@ class SerenaFastMCPTool(FastMCPTool):
         return await super().run(arguments, context, convert_result)
 
 
+class SerenaFastMCP(FastMCP):
+    def __init__(self, *args: Any, **kwargs: Any):
+        self._tool_authorization = SerenaToolAuthorization() if kwargs.get("token_verifier") is not None else None
+        super().__init__(*args, **kwargs)
+
+    async def list_tools(self):
+        tools = await super().list_tools()
+        if self._tool_authorization is None:
+            return tools
+        access_token = self._get_request_access_token()
+        return [tool for tool in tools if self._can_access_tool(tool.name, access_token)]
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]):
+        if self._tool_authorization is not None:
+            tool = self._tool_manager.get_tool(name)
+            if not isinstance(tool, SerenaFastMCPTool):
+                raise ToolError(f"Unknown tool: {name}")
+            self._tool_authorization.require_access(
+                tool_name=name,
+                can_edit=tool.can_edit(),
+                access_token=self._get_request_access_token(),
+            )
+        return await super().call_tool(name, arguments)
+
+    def _get_request_access_token(self) -> AccessToken | None:
+        """Return the current message's token, even inside a long-lived HTTP/SSE session."""
+        # Stateful transports run the server in the initialization request's task context,
+        # but attach the current Starlette request to every later MCP message.
+        try:
+            request = self.get_context().request_context.request
+        except ValueError:
+            return get_access_token()
+
+        if request is None:
+            return get_access_token()
+        if not isinstance(request, HTTPConnection):
+            return None
+
+        user = request.scope.get("user")
+        return user.access_token if isinstance(user, AuthenticatedUser) else None
+
+    def _can_access_tool(self, name: str, access_token: AccessToken | None) -> bool:
+        tool = self._tool_manager.get_tool(name)
+        return (
+            self._tool_authorization is not None
+            and isinstance(tool, SerenaFastMCPTool)
+            and self._tool_authorization.can_access(can_edit=tool.can_edit(), access_token=access_token)
+        )
+
+
 class SerenaMCPFactory:
     """
     Factory for the creation of the Serena MCP server with an associated SerenaAgent.
@@ -152,6 +213,8 @@ class SerenaMCPFactory:
         context: str = DEFAULT_CONTEXT,
         project: str | None = None,
         memory_log_handler: MemoryLogHandler | None = None,
+        token_verifier: TokenVerifier | None = None,
+        auth_settings: AuthSettings | None = None,
     ):
         """
         :param transport: The transport to use for the MCP server.
@@ -160,12 +223,22 @@ class SerenaMCPFactory:
             If the project passed here hasn't been registered yet, it will be registered automatically and can be activated by its name
             afterward.
         :param memory_log_handler: the in-memory log handler to use for the agent's logging
+        :param token_verifier: provider-neutral verifier for HTTP bearer tokens
+        :param auth_settings: MCP SDK authorization settings paired with ``token_verifier``
         """
+        if (token_verifier is None) != (auth_settings is None):
+            raise ValueError("token_verifier and auth_settings must be provided together")
+        if auth_settings is not None and auth_settings.required_scopes:
+            raise ValueError(
+                "auth_settings.required_scopes must be empty; Serena applies serena:read or serena:write authorization per tool"
+            )
         self.transport = transport
         self.context = SerenaAgentContext.load(context)
         self.project = project
         self.agent: SerenaAgent | None = None
         self.memory_log_handler = memory_log_handler
+        self.token_verifier = token_verifier
+        self.auth_settings = auth_settings
 
     @staticmethod
     def _sanitize_for_openai_tools(schema: dict) -> dict:
@@ -382,13 +455,15 @@ class SerenaMCPFactory:
         Settings.model_config = SettingsConfigDict(env_prefix="FASTMCP_")
         instructions = self._get_initial_instructions()
         log.info("MCP server initial instructions:\n%s", instructions)
-        mcp = FastMCP(
+        mcp = SerenaFastMCP(
             name="Serena",
             lifespan=self.server_lifespan,
             website_url="https://oraios.github.io/serena",
             host=host,
             port=port,
             instructions=instructions,
+            token_verifier=self.token_verifier,
+            auth=self.auth_settings,
         )
         return mcp
 

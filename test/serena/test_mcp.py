@@ -1,11 +1,25 @@
 """Tests for the mcp.py module in serena."""
 
+import asyncio
+import warnings
+from collections.abc import Iterator
+from contextlib import contextmanager
+
 import pytest
+from mcp.server.auth.middleware.auth_context import auth_context_var
+from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+from mcp.server.auth.provider import AccessToken
+from mcp.server.auth.settings import AuthSettings
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.fastmcp.tools.base import Tool as MCPTool
 
 from serena.agent import Tool, ToolRegistry
 from serena.config.context_mode import SerenaAgentContext
-from serena.mcp import SerenaMCPFactory
+from serena.mcp import (
+    SerenaFastMCP,
+    SerenaMCPFactory,
+)
+from serena.tools import ToolMarkerCanEdit
 
 make_tool = SerenaMCPFactory.make_mcp_tool
 
@@ -47,7 +61,293 @@ class BasicTool(BaseMockTool):
         **kwargs,
     ) -> str:
         """Mock implementation of apply_ex."""
+        kwargs.pop("mcp_ctx", None)
         return self.apply(**kwargs)
+
+
+class EditingTool(BasicTool, ToolMarkerCanEdit):
+    def __init__(self):
+        super().__init__()
+        self.call_count = 0
+
+    def apply(self, name: str, age: int = 0) -> str:
+        """Record an editing call and return a greeting."""
+        self.call_count += 1
+        return super().apply(name=name, age=age)
+
+
+class TokenVerifierStub:
+    async def verify_token(self, token: str) -> AccessToken | None:
+        return None
+
+
+class ScopedTokenVerifierStub:
+    async def verify_token(self, token: str) -> AccessToken | None:
+        scopes = {
+            "reader": ["serena:read"],
+            "writer": ["serena:write"],
+        }.get(token)
+        if scopes is None:
+            return None
+        return AccessToken(
+            token=token,
+            client_id="shared-client",
+            scopes=scopes,
+            subject="shared-subject",
+            claims={"iss": "https://broker.example.com"},
+        )
+
+
+AUTH_SETTINGS = AuthSettings(
+    issuer_url="https://broker.example.com",
+    resource_server_url="http://127.0.0.1:8000",
+)
+TOKEN_VERIFIER = TokenVerifierStub()
+
+
+@contextmanager
+def access_token_scope(*scopes: str) -> Iterator[None]:
+    access_token = AccessToken(token="token", client_id="test-client", scopes=list(scopes))
+    context_token = auth_context_var.set(AuthenticatedUser(access_token))
+    try:
+        yield
+    finally:
+        auth_context_var.reset(context_token)
+
+
+def make_authorized_server(
+    *,
+    token_verifier: TokenVerifierStub | ScopedTokenVerifierStub = TOKEN_VERIFIER,
+    json_response: bool = False,
+) -> tuple[SerenaFastMCP, EditingTool]:
+    read_tool = make_tool(BasicTool())
+    editing_tool = EditingTool()
+    edit_tool = make_tool(editing_tool)
+    server = SerenaFastMCP(
+        name="Test Serena",
+        token_verifier=token_verifier,
+        auth=AUTH_SETTINGS,
+        json_response=json_response,
+    )
+    server._tool_manager._tools = {
+        read_tool.name: read_tool,
+        edit_tool.name: edit_tool,
+    }
+    return server, editing_tool
+
+
+def mcp_http_headers(token: str, session_id: str | None = None) -> dict[str, str]:
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json, text/event-stream",
+    }
+    if session_id is not None:
+        headers["Mcp-Session-Id"] = session_id
+    return headers
+
+
+def initialize_mcp_http_session(client, token: str) -> str:
+    response = client.post(
+        "/mcp",
+        headers=mcp_http_headers(token),
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "authorization-test", "version": "1.0"},
+            },
+        },
+    )
+    assert response.status_code == 200
+    session_id = response.headers["mcp-session-id"]
+    initialized = client.post(
+        "/mcp",
+        headers=mcp_http_headers(token, session_id),
+        json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+    )
+    assert initialized.status_code == 202
+    return session_id
+
+
+@pytest.mark.parametrize(
+    ("scopes", "expected_tools"),
+    [
+        (("serena:read",), {"basic"}),
+        (("serena:write",), {"basic", "editing"}),
+        (("unrelated",), set()),
+        ((), set()),
+    ],
+)
+def test_authenticated_tool_discovery_uses_serena_scopes(scopes: tuple[str, ...], expected_tools: set[str]) -> None:
+    server, _ = make_authorized_server()
+
+    with access_token_scope(*scopes):
+        tools = asyncio.run(server.list_tools())
+
+    assert {tool.name for tool in tools} == expected_tools
+
+
+def test_reader_direct_call_rejects_editing_tool_before_execution() -> None:
+    server, editing_tool = make_authorized_server()
+
+    with access_token_scope("serena:read"):
+        with pytest.raises(ToolError, match="reader connection cannot call editing tool"):
+            asyncio.run(server.call_tool("editing", {"name": "Reader"}))
+
+    assert editing_tool.call_count == 0
+
+
+def test_reader_can_directly_call_non_editing_tool() -> None:
+    server, _ = make_authorized_server()
+
+    with access_token_scope("serena:read"):
+        asyncio.run(server.call_tool("basic", {"name": "Reader"}))
+
+
+def test_writer_can_directly_call_editing_tool() -> None:
+    server, editing_tool = make_authorized_server()
+
+    with access_token_scope("serena:write"):
+        asyncio.run(server.call_tool("editing", {"name": "Writer"}))
+
+    assert editing_tool.call_count == 1
+
+
+def test_server_without_auth_preserves_existing_tool_access() -> None:
+    server = SerenaFastMCP(name="Test Serena")
+    read_tool = make_tool(BasicTool())
+    edit_tool = make_tool(EditingTool())
+    server._tool_manager._tools = {read_tool.name: read_tool, edit_tool.name: edit_tool}
+
+    tools = asyncio.run(server.list_tools())
+    asyncio.run(server.call_tool("editing", {"name": "Writer"}))
+
+    assert {tool.name for tool in tools} == {"basic", "editing"}
+
+
+def test_authenticated_server_without_request_token_denies_tool_access() -> None:
+    server, editing_tool = make_authorized_server()
+
+    assert asyncio.run(server.list_tools()) == []
+    with pytest.raises(ToolError, match="bearer token does not grant access"):
+        asyncio.run(server.call_tool("editing", {"name": "Unknown"}))
+    assert editing_tool.call_count == 0
+
+
+def test_sdk_authentication_rejects_missing_and_invalid_bearer_tokens() -> None:
+    server, _ = make_authorized_server()
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Using `httpx` with `starlette.testclient` is deprecated")
+        from starlette.testclient import TestClient
+
+        client = TestClient(server.streamable_http_app())
+
+        missing_token = client.post("/mcp")
+        invalid_token = client.post("/mcp", headers={"Authorization": "Bearer invalid"})
+
+    assert missing_token.status_code == 401
+    assert invalid_token.status_code == 401
+
+
+def test_stateful_http_uses_reader_scope_from_each_request() -> None:
+    server, editing_tool = make_authorized_server(
+        token_verifier=ScopedTokenVerifierStub(),
+        json_response=True,
+    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Using `httpx` with `starlette.testclient` is deprecated")
+        from starlette.testclient import TestClient
+
+        with TestClient(server.streamable_http_app(), base_url="http://localhost:8000") as client:
+            session_id = initialize_mcp_http_session(client, "writer")
+            list_response = client.post(
+                "/mcp",
+                headers=mcp_http_headers("reader", session_id),
+                json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            )
+            call_response = client.post(
+                "/mcp",
+                headers=mcp_http_headers("reader", session_id),
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {"name": "editing", "arguments": {"name": "Reader"}},
+                },
+            )
+
+    assert list_response.status_code == 200
+    assert {tool["name"] for tool in list_response.json()["result"]["tools"]} == {"basic"}
+    assert call_response.status_code == 200
+    assert "reader connection cannot call editing tool" in call_response.text.lower()
+    assert editing_tool.call_count == 0
+
+
+def test_stateful_http_uses_writer_scope_from_each_request() -> None:
+    server, editing_tool = make_authorized_server(
+        token_verifier=ScopedTokenVerifierStub(),
+        json_response=True,
+    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Using `httpx` with `starlette.testclient` is deprecated")
+        from starlette.testclient import TestClient
+
+        with TestClient(server.streamable_http_app(), base_url="http://localhost:8000") as client:
+            session_id = initialize_mcp_http_session(client, "reader")
+            list_response = client.post(
+                "/mcp",
+                headers=mcp_http_headers("writer", session_id),
+                json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            )
+            call_response = client.post(
+                "/mcp",
+                headers=mcp_http_headers("writer", session_id),
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {"name": "editing", "arguments": {"name": "Writer"}},
+                },
+            )
+
+    assert list_response.status_code == 200
+    assert {tool["name"] for tool in list_response.json()["result"]["tools"]} == {"basic", "editing"}
+    assert call_response.status_code == 200
+    assert not call_response.json()["result"]["isError"]
+    assert editing_tool.call_count == 1
+
+
+def test_factory_requires_verifier_and_auth_settings_together() -> None:
+    with pytest.raises(ValueError, match="must be provided together"):
+        SerenaMCPFactory(transport="streamable-http", token_verifier=TOKEN_VERIFIER)
+
+    with pytest.raises(ValueError, match="must be provided together"):
+        SerenaMCPFactory(transport="streamable-http", auth_settings=AUTH_SETTINGS)
+
+
+def test_factory_rejects_global_required_scopes() -> None:
+    auth_settings = AUTH_SETTINGS.model_copy(update={"required_scopes": ["serena:read"]})
+
+    with pytest.raises(ValueError, match="required_scopes"):
+        SerenaMCPFactory(
+            transport="streamable-http",
+            token_verifier=TOKEN_VERIFIER,
+            auth_settings=auth_settings,
+        )
+
+
+def test_factory_accepts_verifier_and_auth_settings() -> None:
+    factory = SerenaMCPFactory(
+        transport="streamable-http",
+        token_verifier=TOKEN_VERIFIER,
+        auth_settings=AUTH_SETTINGS,
+    )
+
+    assert factory.token_verifier is TOKEN_VERIFIER
+    assert factory.auth_settings is AUTH_SETTINGS
 
 
 def test_make_tool_basic() -> None:

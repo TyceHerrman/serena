@@ -110,10 +110,11 @@ By default, these services accept connections from localhost only, which is a se
 (given our assumption that the local machine is trusted; see above).
 
 These services can be reconfigured to listen on other addresses, but doing so may have security implications.
-If you need to allow connections from other machines, we recommend that you set up a secure networking environment 
-and ensure that only trusted machines can connect to these services.
-It is the responsibility of the user to restrict access appropriately, e.g. by placing the service behind a reverse
-proxy (adding authentication) or firewall.
+If you need to allow connections from other machines, we recommend that you set up a secure networking environment
+and ensure that only trusted machines can connect to these services. It is the responsibility of the user to restrict
+access appropriately, e.g. by placing the service behind a reverse proxy or firewall. Applications embedding Serena's
+HTTP MCP server can additionally supply the MCP Python SDK's bearer-token verifier and use the `serena:read` and
+`serena:write` scopes described in [Streamable HTTP Mode](streamable-http).
 
 ## Supply Chain Security
 

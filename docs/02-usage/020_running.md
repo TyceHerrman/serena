@@ -78,6 +78,26 @@ See section [The Project Workflow](040_workflow) for more information on how to 
 
 The legacy SSE transport is also supported (via `--transport sse` with corresponding /sse endpoint), its use is discouraged.
 
+#### Scoped Bearer-Token Authorization
+
+Applications that embed Serena can protect an HTTP MCP server by passing the MCP Python SDK's
+`TokenVerifier` and `AuthSettings` abstractions to `SerenaMCPFactory`. Both values must be supplied together,
+and `AuthSettings.required_scopes` must remain empty because Serena authorizes each tool individually.
+
+Serena recognizes two scopes:
+
+- `serena:read` exposes and permits only tools whose `Tool.can_edit()` metadata is false.
+- `serena:write` exposes and permits every configured tool and also grants read access.
+
+The same check is applied when a client calls a tool directly, so omitting editing tools from discovery is not
+the authorization boundary. Serena evaluates the verified token attached to each MCP request, including later
+requests in an existing HTTP or SSE session. The embedding application remains responsible for issuing, expiring,
+and revoking bearer tokens. Serena does not inspect the issuer's registry, lease mechanism, filesystem layout, or
+client lifecycle hooks.
+
+Bearer-token authorization is an embedding API rather than a `start-mcp-server` command-line option. When no
+verifier and authorization settings are supplied, Serena retains its existing stdio and HTTP behavior.
+
 (mcp-args)=
 ### MCP Server Command-Line Arguments
 
