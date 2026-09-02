@@ -1,9 +1,11 @@
 import concurrent.futures
+import os
 import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass
+from pathlib import Path
 from threading import Thread
 from typing import Generic, TypeVar
 
@@ -13,6 +15,10 @@ from sensai.util.string import ToStringMixin
 
 log = logging.getLogger(__name__)
 T = TypeVar("T")
+
+
+class TaskExecutorPoisonedError(RuntimeError):
+    pass
 
 
 class TaskExecutor:
@@ -30,6 +36,7 @@ class TaskExecutor:
         self._task_executor_current_task: TaskExecutor.Task | None = None
         self._task_executor_last_executed_task_info: TaskExecutor.TaskInfo | None = None
         self._task_completion_callback = task_completion_callback
+        self._task_executor_poisoned_reason: str | None = None
 
     class Task(ToStringMixin, Generic[T]):
         def __init__(self, function: Callable[[], T], name: str, logged: bool = True, timeout: float | None = None):
@@ -44,6 +51,8 @@ class TaskExecutor:
             self.logged = logged
             self.timeout = timeout
             self._function = function
+            self._started = False
+            self._execution_finished = threading.Event()
 
         def _tostring_includes(self) -> list[str]:
             return ["name"]
@@ -67,8 +76,11 @@ class TaskExecutor:
                     if not self.future.done():
                         log.error(f"Error during execution of {self.name}: {e}", exc_info=e)
                         self.future.set_exception(e)
+                finally:
+                    self._execution_finished.set()
 
             thread = Thread(target=run_task, name=self.name)
+            self._started = True
             thread.start()
 
         def is_done(self) -> bool:
@@ -117,9 +129,30 @@ class TaskExecutor:
                 self.future.result(timeout=self.timeout)
             except concurrent.futures.TimeoutError:
                 return False
+            except concurrent.futures.CancelledError:
+                return not self._started or self._execution_finished.is_set()
             except:
                 pass
             return True
+
+    def _poison(self, reason: str) -> None:
+        with self._task_executor_lock:
+            if self._task_executor_poisoned_reason is not None:
+                return
+            self._task_executor_poisoned_reason = reason
+            error = TaskExecutorPoisonedError(reason)
+            queued = self._task_executor_queue
+            self._task_executor_queue = []
+            poison_path = os.getenv("SERENA_TASK_EXECUTOR_POISON_FILE", "").strip()
+            if poison_path:
+                path = Path(poison_path)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = path.with_suffix(".tmp")
+                temporary.write_text(reason + "\n", encoding="utf-8")
+                temporary.replace(path)
+            for task in queued:
+                if not task.future.done():
+                    task.future.set_exception(error)
 
     def _process_task_queue(self) -> None:
         while True:
@@ -142,7 +175,11 @@ class TaskExecutor:
             # wait for task completion
             is_done = task.wait_until_done()
             if not is_done:
-                log.warning("Task %s did not complete within the timeout of %s seconds; continuing ...", task.name, task.timeout)
+                reason = (
+                    f"Task {task.name} did not stop after timeout or cancellation; the Serena server must be restarted before more work"
+                )
+                log.error(reason)
+                self._poison(reason)
             with self._task_executor_lock:
                 self._task_executor_current_task = None
                 if task.logged:
@@ -207,6 +244,8 @@ class TaskExecutor:
         :return: the task object, through which the task's future result can be accessed
         """
         with self._task_executor_lock:
+            if self._task_executor_poisoned_reason is not None:
+                raise TaskExecutorPoisonedError(self._task_executor_poisoned_reason)
             if logged:
                 task_prefix_name = f"Task-{self._task_executor_task_index}"
                 self._task_executor_task_index += 1

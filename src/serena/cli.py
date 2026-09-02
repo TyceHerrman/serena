@@ -279,6 +279,12 @@ class TopLevelCommands(AutoRegisteringGroup):
         "--port", type=int, default=8000, show_default=True, help="Listen port for the MCP server (when using corresponding transport)."
     )
     @click.option(
+        "--poison-file",
+        type=click.Path(dir_okay=False, path_type=Path),
+        default=None,
+        help="Mark this file if a timed-out worker makes the server unsafe to reuse.",
+    )
+    @click.option(
         "--enable-web-dashboard",
         type=bool,
         is_flag=False,
@@ -326,6 +332,7 @@ class TopLevelCommands(AutoRegisteringGroup):
         transport: Literal["stdio", "sse", "streamable-http"],
         host: str,
         port: int,
+        poison_file: Path | None,
         enable_web_dashboard: bool | None,
         open_web_dashboard: bool | None,
         enable_gui_log_window: bool | None,
@@ -354,6 +361,8 @@ class TopLevelCommands(AutoRegisteringGroup):
 
         log.info("Initializing Serena MCP server")
         log.info("Storing logs in %s", log_path)
+        if poison_file is not None:
+            os.environ["SERENA_TASK_EXECUTOR_POISON_FILE"] = str(poison_file)
 
         # Handle --project-from-cwd flag
         project_activation_error: str | None = None

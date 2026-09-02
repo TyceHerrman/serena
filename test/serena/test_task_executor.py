@@ -2,7 +2,7 @@ import time
 
 import pytest
 
-from serena.task_executor import TaskExecutor
+from serena.task_executor import TaskExecutor, TaskExecutorPoisonedError
 
 
 @pytest.fixture
@@ -58,7 +58,8 @@ def test_task_executor_exception(executor):
 def test_task_executor_cancel_current(executor):
     """
     Tests that tasks that are cancelled are handled correctly, i.e. that
-      * subsequent tasks are executed as soon as cancellation ensues.
+      * the executor is poisoned while the cancelled worker is still running,
+      * subsequent tasks are not overlapped with the cancelled worker.
       * the cancelled task raises CancelledError when result() is called.
     """
     start_time = time.time()
@@ -66,7 +67,8 @@ def test_task_executor_cancel_current(executor):
     future2 = executor.issue_task(Task(1).run, name="task2")
     time.sleep(1)
     future1.cancel()
-    assert future2.result() is True
+    with pytest.raises(TaskExecutorPoisonedError):
+        future2.result()
     end_time = time.time()
     assert (end_time - start_time) < 9, "Cancelled task did not stop in time"
     have_cancelled_error = False
@@ -76,6 +78,25 @@ def test_task_executor_cancel_current(executor):
         assert e.__class__.__name__ == "CancelledError"
         have_cancelled_error = True
     assert have_cancelled_error
+
+
+def test_task_executor_timeout_poisons_and_rejects_later_work(tmp_path, monkeypatch):
+    poison_file = tmp_path / "server.poisoned"
+    monkeypatch.setenv("SERENA_TASK_EXECUTOR_POISON_FILE", str(poison_file))
+    executor = TaskExecutor("TimeoutExecutor")
+    slow_task = Task(1)
+    slow = executor.issue_task(slow_task.run, name="slow", timeout=0.05)
+    queued = executor.issue_task(Task(0).run, name="queued")
+    while not slow_task.did_run:
+        time.sleep(0.01)
+
+    with pytest.raises(TimeoutError):
+        slow.result(timeout=0.01)
+    with pytest.raises(TaskExecutorPoisonedError):
+        queued.result(timeout=1)
+    with pytest.raises(TaskExecutorPoisonedError):
+        executor.issue_task(Task(0).run, name="too-late")
+    assert poison_file.is_file()
 
 
 def test_task_executor_cancel_future(executor):
@@ -116,11 +137,8 @@ def test_task_executor_cancellation_via_task_info(executor):
     task_infos[0].cancel()
     time.sleep(0.5)
     task_infos3 = executor.get_current_tasks()
-    assert len(task_infos3) == 1  # Cancelled task is gone from the queue
-    task_infos3[0].cancel()
-    try:
-        task_infos3[0].future.result()
-    except:
-        pass
+    assert len(task_infos3) == 0
+    with pytest.raises(TaskExecutorPoisonedError):
+        task_infos[1].future.result()
     end_time = time.time()
     assert (end_time - start_time) < 9, "Cancelled task did not stop in time"
