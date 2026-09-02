@@ -10,6 +10,7 @@ from serena.config.serena_config import (
     SerenaPaths,
 )
 from serena.constants import SERENA_FILE_ENCODING
+from serena.util.atomic_write import atomic_write_text
 from serena.util.text_utils import ContentReplacer
 
 from .memory_reference_analysis import (
@@ -215,8 +216,7 @@ class MemoryManager:
         self._check_not_ignored(name)
         self._check_write_access(name, is_tool_context)
         memory_file_path = self.get_memory_file_path(name)
-        with open(memory_file_path, "w", encoding=self._encoding) as f:
-            f.write(content)
+        atomic_write_text(memory_file_path, content, encoding=self._encoding)
         return f"Memory {name} written."
 
     class MemoriesList:

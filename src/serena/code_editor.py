@@ -13,6 +13,7 @@ from solidlsp.ls import LSPFileBuffer
 from solidlsp.ls_utils import PathUtils, TextStepper, TextUtils
 
 from .project import Project
+from .util.atomic_write import atomic_write_text
 from .util.file_proxy import FileProxy
 
 log = logging.getLogger(__name__)
@@ -89,8 +90,12 @@ class CodeEditor(Generic[TSymbol], ABC):
     def _save_edited_file(self, edited_file: "CodeEditor.EditedFile") -> None:
         abs_path = os.path.join(self.project_root, edited_file.relative_path)
         new_contents = edited_file.get_contents()
-        with open(abs_path, "w", encoding=self.encoding, newline=self.newline) as f:
-            f.write(new_contents)
+        atomic_write_text(
+            abs_path,
+            new_contents,
+            encoding=self.encoding,
+            newline=self.newline,
+        )
 
     @abstractmethod
     def _find_unique_symbol(self, name_path: str, relative_file_path: str) -> TSymbol:
