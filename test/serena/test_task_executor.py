@@ -1,3 +1,4 @@
+import threading
 import time
 
 import pytest
@@ -118,27 +119,36 @@ def test_task_executor_cancel_future(executor):
     assert not task2.did_run
 
 
-def test_task_executor_cancellation_via_task_info(executor):
-    start_time = time.time()
-    executor.issue_task(Task(10).run, "task1")
-    executor.issue_task(Task(10).run, "task2")
-    task_infos = executor.get_current_tasks()
-    task_infos2 = executor.get_current_tasks()
+def test_task_executor_cancellation_via_task_info():
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    task_processed = threading.Event()
+    executor = TaskExecutor("TestExecutor", task_completion_callback=task_processed.set)
 
-    # test expected tasks
-    assert len(task_infos) == 2
-    assert "task1" in task_infos[0].name
-    assert "task2" in task_infos[1].name
+    def blocking_task():
+        worker_started.set()
+        return release_worker.wait(timeout=10)
 
-    # test task identifiers being stable
-    assert task_infos2[0].task_id == task_infos[0].task_id
+    running = executor.issue_task(blocking_task, "task1")
+    queued = Task(0)
+    executor.issue_task(queued.run, "task2")
+    try:
+        # Cancellation must happen after execution starts, not while task1 is queued.
+        assert worker_started.wait(timeout=5)
+        task_infos = executor.get_current_tasks()
+        task_infos2 = executor.get_current_tasks()
 
-    # test cancellation
-    task_infos[0].cancel()
-    time.sleep(0.5)
-    task_infos3 = executor.get_current_tasks()
-    assert len(task_infos3) == 0
-    with pytest.raises(TaskExecutorPoisonedError):
-        task_infos[1].future.result()
-    end_time = time.time()
-    assert (end_time - start_time) < 9, "Cancelled task did not stop in time"
+        assert len(task_infos) == 2
+        assert "task1" in task_infos[0].name
+        assert "task2" in task_infos[1].name
+        assert task_infos2[0].task_id == task_infos[0].task_id
+
+        task_infos[0].cancel()
+        assert task_processed.wait(timeout=5)
+        assert executor.get_current_tasks() == []
+        with pytest.raises(TaskExecutorPoisonedError):
+            task_infos[1].future.result(timeout=1)
+        assert not queued.did_run
+    finally:
+        release_worker.set()
+        assert running._execution_finished.wait(timeout=5)
